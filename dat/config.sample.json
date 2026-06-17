@@ -24,6 +24,7 @@
             "username": "admin",
             "customChunkSize": 100,
             "minimumChunkSize": 20,
+            "chunkSplitterVersion": "v3-rabin-karp",
             "obfuscatePassphrase": "passphrase",
             "baseDir": "syncLinux/"
         },

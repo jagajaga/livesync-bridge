@@ -12,8 +12,49 @@ import { walk } from 'fs/walk';
 
 import { scheduleTask } from "octagonal-wheels/concurrency/task";
 
+// --- Dispatch throughput ---
+// The stock dispatch path processes files essentially serially with a per-file
+// artificial settle delay, so re-scanning a large vault takes hours. This (a)
+// drops the bulk-irrelevant delays and (b) overlaps per-file dispatch through a
+// bounded gate so the per-file CouchDB round-trips interleave without flooding
+// the server.
+//
+// CAUTION: the LiveSync core (LiveSyncLocalDB) is NOT safe for high file-level
+// concurrency. Values that are too high surface as intermittent
+// "Cannot read properties of undefined (reading 'getDBEntryMeta')" errors as
+// the shared DB handle is torn out from under an in-flight op. Keep this LOW.
+// Tunable without a rebuild via the BRIDGE_DISPATCH_CONCURRENCY env var.
+const DISPATCH_CONCURRENCY = Math.max(
+    1,
+    Number(Deno.env.get("BRIDGE_DISPATCH_CONCURRENCY") ?? "1") || 1,
+);
+
+// Minimal bounded-concurrency gate: at most `max` callbacks run at once; the
+// rest queue. A slot is held for the whole callback and handed to the next
+// waiter on release.
+function makeGate(max: number) {
+    let active = 0;
+    const waiters: Array<() => void> = [];
+    return async function run<T>(fn: () => Promise<T>): Promise<T> {
+        if (active >= max) {
+            await new Promise<void>((r) => waiters.push(r));
+        }
+        active++;
+        try {
+            return await fn();
+        } finally {
+            active--;
+            const next = waiters.shift();
+            if (next) next();
+        }
+    };
+}
+
 export class PeerStorage extends Peer {
     declare config: PeerStorageConf;
+
+    // Bounds how many file dispatches run concurrently (see LOCAL PATCH above).
+    private dispatchGate = makeGate(DISPATCH_CONCURRENCY);
 
 
     constructor(conf: PeerStorageConf, dispatcher: DispatchFun) {
@@ -168,10 +209,12 @@ export class PeerStorage extends Peer {
 
         if (data === false) return;
 
-        scheduleOnceIfDuplicated(pathSrc, async () => {
+        scheduleOnceIfDuplicated(pathSrc, () => this.dispatchGate(async () => {
             // console.log(data);
             await this.writeFileStat(path);
-            await delay(250);
+            // LOCAL PATCH: per-file delay(250) removed for bulk-scan throughput.
+            // isRepeating() below still dedups identical re-emits, and
+            // dispatchGate bounds concurrency.
             if (!await this.isRepeating(path, data)) {
                 this.sendLog(`${path} change detected`);
                 await this.dispatchToHub(this, this.toGlobalPath(path), data);
@@ -179,7 +222,7 @@ export class PeerStorage extends Peer {
             // else {
             //     this.sendLog(`${path} change repeating detected`);
             // }
-        });
+        }));
     }
     async dispatchDeleted(pathSrc: string) {
         const lP = this.toStoragePath(this.toLocalPath("."));
@@ -301,7 +344,10 @@ export class PeerStorage extends Peer {
             {
                 ignoreInitial: !this.config.scanOfflineChanges,
                 awaitWriteFinish: {
-                    stabilityThreshold: 500,
+                    // LOCAL PATCH: was 500ms. Lowered so chokidar emits events
+                    // for thousands of files quickly during a bulk re-scan.
+                    stabilityThreshold: 50,
+                    pollInterval: 20,
                 },
             });
 
